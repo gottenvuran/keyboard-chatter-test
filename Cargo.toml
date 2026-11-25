@@ -1,0 +1,23 @@
+[package]
+license = "MIT"
+name = "keyboard-chatter-test"
+version = "0.1.0"
+edition = "2021"
+description = "Find which keys on your keyboard chatter (double-press)."
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+strip = true
+opt-level = 2
