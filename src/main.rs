@@ -25,7 +25,10 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyNameTextW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyNameTextW, GetKeyboardLayout, GetKeyboardLayoutList, LoadKeyboardLayoutW, MapVirtualKeyExW, ToUnicodeEx,
+    UnloadKeyboardLayout, HKL, KLF_NOTELLSHELL, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK_EX,
+};
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT,
 };
@@ -194,7 +197,69 @@ fn start_hook() {
     });
 }
 
-fn key_name(id: u32) -> String {
+/// For testing: a layout loaded from CHATTER_TEST_LAYOUT (e.g. 00000407 for German) replaces the
+/// current one, so other layouts can be checked without installing them.
+static TEST_LAYOUT: OnceLock<usize> = OnceLock::new();
+
+/// Keyboard layout of the foreground window (what the user is typing with right now).
+fn current_layout() -> HKL {
+    if let Some(h) = TEST_LAYOUT.get() {
+        return HKL(*h as _);
+    }
+    unsafe {
+        let tid = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        GetKeyboardLayout(tid)
+    }
+}
+
+/// Physical keyboard shape. US-style layouts are usually on ANSI keyboards (no key next to left
+/// Shift, one-row Enter); most European layouts are on ISO keyboards.
+fn layout_is_ansi(hkl: HKL) -> bool {
+    let lang = hkl.0 as usize as u32 & 0xFFFF;
+    matches!(lang, 0x0409 | 0x1009 | 0x0404 | 0x0804 | 0x0C04 | 0x1004 | 0x0412 | 0x0411 | 0x0439 | 0x0421 | 0x0464)
+}
+
+/// True if the layout types characters with AltGr (Ctrl+Alt), so the right Alt key is labeled AltGr.
+fn layout_has_altgr(hkl: HKL) -> bool {
+    let mut state = [0u8; 256];
+    for vk in [0x11, 0x12, 0xA2, 0xA5] {
+        state[vk] = 0x80; // Ctrl, Alt, left Ctrl, right Alt
+    }
+    (0x30..=0xDFu32).any(|vk| {
+        let mut buf = [0u16; 8];
+        // Flag 4: don't change the keyboard state (dead keys).
+        let n = unsafe { ToUnicodeEx(vk, 0, &state, &mut buf, 4, hkl) };
+        n < 0 || (n > 0 && buf[0] >= 0x20)
+    })
+}
+
+/// The character a key types in the given layout (unshifted, shown in upper case), if any.
+fn key_char(id: u32, hkl: HKL) -> Option<String> {
+    if id & 0xE000 != 0 {
+        return None;
+    }
+    let scan = id & 0xFF;
+    unsafe {
+        // Numpad decimal key: comma or period depending on the layout.
+        let vk = if scan == 0x53 { 0x6E } else { MapVirtualKeyExW(scan, MAPVK_VSC_TO_VK_EX, hkl) };
+        if vk == 0 {
+            return None;
+        }
+        // Dead keys (accents) have the top bit set.
+        let c = char::from_u32(MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, hkl) & 0xFFFF)?;
+        if c <= ' ' {
+            return None;
+        }
+        // Turkish: the upper case of "i" is "İ". Keep "ß" (its upper case is "SS").
+        if c == 'i' {
+            return Some("İ".into());
+        }
+        let up: String = c.to_uppercase().collect();
+        Some(if up.chars().count() == 1 { up } else { c.to_string() })
+    }
+}
+
+fn key_name(id: u32, hkl: HKL) -> String {
     if id & 0x10000 != 0 {
         return format!("Key (VK {:#04X})", id & 0xFF);
     }
@@ -204,13 +269,14 @@ fn key_name(id: u32) -> String {
         0x76 => return "F24".into(),
         _ => {}
     }
+    if let Some(c) = key_char(id, hkl) {
+        return c;
+    }
     let lp = ((id & 0xFF) << 16) | if id & 0xE000 != 0 { 1 << 24 } else { 0 };
     let mut buf = [0u16; 64];
     let n = unsafe { GetKeyNameTextW(lp as i32, &mut buf) };
     if n > 0 {
-        let s = String::from_utf16_lossy(&buf[..n as usize]);
-        // Turkish layout: uppercase of "i" is "İ" (to_uppercase gives "I").
-        if s == "i" { "İ".to_string() } else if s.chars().count() == 1 { s.to_uppercase() } else { s }
+        String::from_utf16_lossy(&buf[..n as usize])
     } else {
         format!("Key {:#06X}", id)
     }
@@ -226,8 +292,8 @@ struct K {
     label: &'static str,
 }
 
-/// Full-size ISO keyboard. Character labels come from the active Windows keyboard layout.
-fn layout() -> Vec<K> {
+/// Full-size ANSI or ISO keyboard. Character labels come from the active Windows keyboard layout.
+fn layout(iso: bool, altgr: bool) -> Vec<K> {
     let mut v = Vec::new();
     let mut add = |id: u32, x: f32, y: f32, w: f32, h: f32, label: &'static str| v.push(K { id, x, y, w, h, label });
     const F: [&str; 12] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"];
@@ -251,16 +317,28 @@ fn layout() -> Vec<K> {
     for i in 0..12 {
         add(0x10 + i, 1.5 + i as f32, 2.5, 1.0, 1.0, "");
     }
-    add(0x1C, 13.75, 2.5, 1.25, 2.0, "Enter");
+    if iso {
+        add(0x1C, 13.75, 2.5, 1.25, 2.0, "Enter");
+    } else {
+        add(0x2B, 13.5, 2.5, 1.5, 1.0, "");
+    }
     // Home row
     add(0x3A, 0.0, 3.5, 1.75, 1.0, "Caps");
     for i in 0..11 {
         add(0x1E + i, 1.75 + i as f32, 3.5, 1.0, 1.0, "");
     }
-    add(0x2B, 12.75, 3.5, 1.0, 1.0, "");
+    if iso {
+        add(0x2B, 12.75, 3.5, 1.0, 1.0, "");
+    } else {
+        add(0x1C, 12.75, 3.5, 2.25, 1.0, "Enter");
+    }
     // Bottom letter row
-    add(0x2A, 0.0, 4.5, 1.25, 1.0, "Shift");
-    add(0x56, 1.25, 4.5, 1.0, 1.0, "");
+    if iso {
+        add(0x2A, 0.0, 4.5, 1.25, 1.0, "Shift");
+        add(0x56, 1.25, 4.5, 1.0, 1.0, "");
+    } else {
+        add(0x2A, 0.0, 4.5, 2.25, 1.0, "Shift");
+    }
     for i in 0..10 {
         add(0x2C + i, 2.25 + i as f32, 4.5, 1.0, 1.0, "");
     }
@@ -272,7 +350,7 @@ fn layout() -> Vec<K> {
         (0xE05B, 1.25, "Win"),
         (0x38, 1.25, "Alt"),
         (0x39, 6.25, "Space"),
-        (0xE038, 1.25, "AltGr"),
+        (0xE038, 1.25, if altgr { "AltGr" } else { "Alt" }),
         (0xE05C, 1.25, "Win"),
         (0xE05D, 1.25, "Menu"),
         (0xE01D, 1.25, "Ctrl"),
@@ -309,7 +387,7 @@ fn layout() -> Vec<K> {
     add(0x51, n + 2.0, 4.5, 1.0, 1.0, "3");
     add(0xE01C, n + 3.0, 4.5, 1.0, 2.0, "Enter");
     add(0x52, n, 5.5, 2.0, 1.0, "0");
-    add(0x53, n + 2.0, 5.5, 1.0, 1.0, "Del");
+    add(0x53, n + 2.0, 5.5, 1.0, 1.0, "");
     v
 }
 
@@ -349,6 +427,19 @@ struct App {
     thr: f32,
     /// Typing area for testing inside the app.
     text: String,
+    /// Keyboard layout the labels were made for.
+    hkl: HKL,
+    shape: Shape,
+    /// The key next to left Shift (ISO only) was pressed, so the keyboard is ISO.
+    saw_iso_key: bool,
+    iso: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Auto,
+    Ansi,
+    Iso,
 }
 
 const UNTESTED: Color32 = Color32::from_rgb(52, 56, 64);
@@ -357,13 +448,51 @@ const WARN: Color32 = Color32::from_rgb(214, 128, 20);
 const BAD: Color32 = Color32::from_rgb(196, 40, 48);
 
 impl App {
+    fn new() -> Self {
+        let mut app = App {
+            stats: HashMap::new(),
+            bounces: Vec::new(),
+            names: HashMap::new(),
+            keys: Vec::new(),
+            thr: 50.0,
+            text: String::new(),
+            hkl: HKL::default(),
+            shape: Shape::Auto,
+            saw_iso_key: false,
+            iso: true,
+        };
+        app.refresh_layout(true);
+        app
+    }
+
+    /// Follows the keyboard layout the user is typing with (labels, ANSI/ISO shape, AltGr).
+    fn refresh_layout(&mut self, force: bool) {
+        let hkl = current_layout();
+        let hkl = if hkl.is_invalid() { self.hkl } else { hkl };
+        let iso = match self.shape {
+            Shape::Ansi => false,
+            Shape::Iso => true,
+            Shape::Auto => self.saw_iso_key || !layout_is_ansi(hkl),
+        };
+        if force || hkl != self.hkl || iso != self.iso {
+            self.hkl = hkl;
+            self.iso = iso;
+            self.names.clear();
+            self.keys = layout(iso, layout_has_altgr(hkl));
+        }
+    }
+
     fn name(&mut self, id: u32) -> String {
-        self.names.entry(id).or_insert_with(|| key_name(id)).clone()
+        let hkl = self.hkl;
+        self.names.entry(id).or_insert_with(|| key_name(id, hkl)).clone()
     }
 
     fn poll(&mut self) {
         let evs = std::mem::take(&mut *EVENTS.lock().unwrap());
         for e in evs {
+            if e.id == 0x56 {
+                self.saw_iso_key = true;
+            }
             let s = self.stats.entry(e.id).or_default();
             if e.down {
                 if s.down {
@@ -413,7 +542,8 @@ impl App {
                 painter.rect_stroke(r, 4.0, Stroke::new(2.5, Color32::from_rgb(253, 224, 71)), StrokeKind::Inside);
             }
             let label = if k.label.is_empty() {
-                self.names.entry(k.id).or_insert_with(|| key_name(k.id)).clone()
+                let hkl = self.hkl;
+                self.names.entry(k.id).or_insert_with(|| key_name(k.id, hkl)).clone()
             } else {
                 k.label.to_string()
             };
@@ -469,8 +599,11 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.refresh_layout(false);
+        // Notice layout switches (e.g. Win+Space) even when no other event arrives.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -506,6 +639,24 @@ impl App {
             if ui.button("Copy results").clicked() {
                 let t = self.summary_text();
                 ui.ctx().copy_text(t);
+            }
+            ui.add_space(12.0);
+            ui.label("Keyboard shape:");
+            let auto = format!("Auto ({})", if self.iso { "ISO" } else { "ANSI" });
+            let before = self.shape;
+            egui::ComboBox::from_id_salt("shape")
+                .selected_text(match self.shape {
+                    Shape::Auto => auto.clone(),
+                    Shape::Ansi => "ANSI".into(),
+                    Shape::Iso => "ISO".into(),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.shape, Shape::Auto, auto);
+                    ui.selectable_value(&mut self.shape, Shape::Ansi, "ANSI (one-row Enter)");
+                    ui.selectable_value(&mut self.shape, Shape::Iso, "ISO (two-row Enter)");
+                });
+            if self.shape != before {
+                self.refresh_layout(true);
             }
         });
         ui.label(
@@ -640,13 +791,33 @@ fn main() -> eframe::Result {
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    // Test layout: loaded without telling the shell, unloaded on exit unless it was already installed.
+    let mut unload: Option<HKL> = None;
+    if let Ok(klid) = std::env::var("CHATTER_TEST_LAYOUT") {
+        unsafe {
+            let mut list = [HKL::default(); 64];
+            let n = GetKeyboardLayoutList(Some(&mut list)) as usize;
+            if let Ok(h) = LoadKeyboardLayoutW(&windows::core::HSTRING::from(klid), KLF_NOTELLSHELL) {
+                if !list[..n].contains(&h) {
+                    unload = Some(h);
+                }
+                let _ = TEST_LAYOUT.set(h.0 as usize);
+            }
+        }
+    }
+    let result = eframe::run_native(
         "Keyboard Chatter Test",
         options,
         Box::new(|cc| {
             let _ = CTX.set(cc.egui_ctx.clone());
             start_hook();
-            Ok(Box::new(App { stats: HashMap::new(), bounces: Vec::new(), names: HashMap::new(), keys: layout(), thr: 50.0, text: String::new() }))
+            Ok(Box::new(App::new()))
         }),
-    )
+    );
+    if let Some(h) = unload {
+        unsafe {
+            let _ = UnloadKeyboardLayout(h);
+        }
+    }
+    result
 }

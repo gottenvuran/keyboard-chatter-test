@@ -25,6 +25,16 @@ Windows may show a SmartScreen warning because the file is not code-signed. Clic
 4. The **Chattering keys** table lists the presses, chatter count, rate and shortest gap for each key.
    **Copy results** copies the table as text.
 
+## Your keyboard layout
+
+The on-screen keyboard follows the Windows keyboard layout you're typing with: QWERTY, QWERTZ, AZERTY,
+Turkish and so on, including accent keys, AltGr and the numpad decimal key. If you switch layouts (for example
+with Win+Space), it updates right away.
+
+It also guesses the physical shape of your keyboard from the layout: ANSI (one-row Enter, as on US keyboards)
+or ISO (two-row Enter and an extra key next to left Shift, as on most European keyboards). If it guesses
+wrong, pick the right shape under **Keyboard shape**. Pressing the extra ISO key switches to ISO automatically.
+
 ## How it works
 
 A press counts as chatter when the same key is pressed again **sooner than the threshold after it was
@@ -60,6 +70,14 @@ cargo build --release
 ```
 
 The executable is written to `target\release\keyboard-chatter-test.exe`.
+
+## Testing without a keyboard
+
+Two environment variables are meant for automated testing:
+
+- `CHATTER_TEST_INJECTED=1` counts software-generated keys from startup (same as ticking the checkbox).
+- `CHATTER_TEST_LAYOUT=00000407` shows a layout by its Windows layout id (here German) instead of the current one.
+  If the layout wasn't installed, it is loaded only for this run and unloaded on exit.
 
 ## License
 
